@@ -1,543 +1,353 @@
+package src;
+
+import etomica.space.Space;
+import etomica.space.Vector;
+import etomica.space3d.Space3D;
+import etomica.util.random.IRandom;
+import etomica.util.random.RandomMersenneTwister;
+import etomica.util.random.RandomNumberGeneratorUnix;
 import org.apache.commons.math3.geometry.euclidean.threed.Vector3D;
-import org.apache.commons.math3.linear.BlockRealMatrix;
-import org.apache.commons.math3.linear.EigenDecomposition;
 import java.util.*;
 
+/**
+ * Class to pack regular tetrahedra as densely as possible. Uses hard walls
+ * instead of periodic boundary conditions. The packing algorithm is
+ * summarized as follows:
+ *
+ * 1) Obtain input 'N' denoting the number of regular tetrahedra to pack,
+ * from the user.
+ * 2) Initialize the possible length of edges to an array containing few values:
+ * [0.01, 0.2, 0.1, 1, 2, 4, 8, 16, 100].
+ * 3) Loop through the array of edge lengths and let the current edge length
+ * be l. Do the following:
+ *      a) Randomize the positions of N regular tetrahedra of length l in 3D
+ *      space.
+ *      b) Fix the maximum number of steps needed for convergence.
+ *      c) Repeated pair-wise overlap detection and resolution based on
+ *      computing the divide projections for both tetrahedra. See
+ *      {@linkplain OverlapDetectionAndResolution}
+ *      d) After convergence, loop through all position vectors to find the
+ *      range (i.e., max - min) of x-, y-, z- coordinates among all
+ *      tetrahedra vertices. This gives us the basis vectors and the volume
+ *      of the cell.
+ *      e) Evaluate the density and store the position vectors of all
+ *      tetrahedra as well as the basis vectors.
+ * 4) Choose the l that results in the highest packing density as the result.
+ *
+ * @author Ram
+ */
 public class PackRegularTetrahedra {
 
-    public static final Vector3D origin = new Vector3D(new double[]{0, 0, 0});
+    // Number of regular tetrahedra to be packed.
+    public int n;
+
+    // Maximum number of steps for convergence.
+    public int maxSteps = 10000;
+
+    // Array of tetrahedra.
+    public RegularTetrahedron[] rts, bestPackingRTs;
+
+    // Overlap detection and resolution tool.
+    public OverlapDetectionAndResolution od;
+
+    // Maximum density possible for a given N.
+    public double maxDensity = -1.0;
+
+    // Unit cell vectors corresponding to maximum density.
+    public Vector3D[] unitCell;
+
+    // Vertex positions corresponding to maximum density.
+    public Vector3D[][] vertexPositions;
+
+    // Edge length corresponding to maximum density.
+    public double maxEdgeLength = Double.NaN;
 
     /**
-     * Function to calculate the unit normal of the least-squares plane of a
-     * given set of points in 3D space. Following the procedure outlined in
-     * detail in:
-     * Y. Kallus, V. Elser, and S. Gravel, "Method for dense packing
-     * discovery," Physical Review E, vol. 82, no. 5, Nov. 2010.
-     *
-     * Short summary:
-     * The algorithm proceeds to compute the centroid (r*) of the given set of
-     * vectors as follows:
-     * r* = sum_{r belongs to s} r / |s|, where r is the vector and |s| is the
-     * size of the set.
-     *
-     * Then computes the symmetric matrix M as follows:
-     * M = sum_{r belongs to s} (r - r*)^T (r - r*) , where ^T denotes the
-     * transpose operation.
-     *
-     * Computes the eigenvalues and eigenvectors of M. The unit normal is the
-     * eigenvector corresponding to the smallest eigenvalue.
-     *
-     * @param s A list containing the subset of vectors denoting the positions
-     *         of vertices of the two intersecting regular tetrahedra.
-     * @return An array containing the centroid of the given subset as the
-     * first element and the unit normal of the least-squares plane as the
-     * second element.
+     * Constructor that takes the number of regular tetrahedra to pack as an
+     * argument.
+     * @param N Desired number.
      */
-    public static Vector3D[] findLeastSqNormal(List<Vector3D> s) {
-
-        int sz = s.size();
-        if (sz < 3) throw new RuntimeException("The size should be at least " +
-                "3");
-
-        Vector3D[] result = new Vector3D[2];
-
-        // Compute centroid.
-        Vector3D centroid = origin;
-        for (Vector3D r : s) centroid = centroid.add(r);
-        centroid = centroid.scalarMultiply(1.0 / sz);
-        result[0] = centroid;
-
-        // Compute matrix M.
-        BlockRealMatrix M = new BlockRealMatrix(3, 3);
-        BlockRealMatrix t = new BlockRealMatrix(3, 3);
-        for (Vector3D r : s) {
-            t.setColumn(0, r.subtract(centroid).toArray());
-            M = M.add(t.multiply(t.transpose()));
-        }
-
-        // Compute eigenvalues and eigenvectors.
-        EigenDecomposition eig = new EigenDecomposition(M);
-        if (eig.hasComplexEigenvalues()) throw new RuntimeException("Oops, " +
-                "system has complex eigenvalues!");
-
-        // Compute minimum eigenvalue and corresponding eigenvector.
-        double min = Double.POSITIVE_INFINITY;
-        Vector3D normal = null;
-        for (int i=0; i<3; i++) {
-            double eValue = eig.getRealEigenvalue(i);
-            if (eValue < min) {
-                min = eValue;
-                normal = new Vector3D(eig.getEigenvector(i).toArray());
-            }
-        }
-        if (normal == null) throw new RuntimeException("Eigenvector is null!");
-        if (normal.isNaN() || normal.isInfinite()) throw new RuntimeException
-                ("Normal is NaN or infinity!");
-        result[1] = normal;
-        return result;
+    public PackRegularTetrahedra(int N) {
+        if (N < 2) throw new IllegalArgumentException("N must be at least 2");
+        n = N;
+        rts = new RegularTetrahedron[n];
+        od = new OverlapDetectionAndResolution();
     }
 
     /**
-     * Function to generate all subsets of a given list of vectors. We return
-     * a list of lists here instead of a set of sets because two different
-     * vertices of the two tetrahedra may coincide. If we used a set, we
-     * would miss this case. Doesn't return empty set as a subset.
-     *
-     * Note: This algorithm only works if list size is less than 32 as we use
-     * integer's binary representation to compute the subsets. For two
-     * tetrahedra with maximum of 8 vectors in this list, this algorithm
-     * should suffice.
-
-     * @param v List of vectors.
-     * @return The list of list containing all subsets of the given list.
+     * Function to randomize the positions of N regular tetrahedra. The
+     * algorithm proceeds by generating a uniform random number on the
+     * surface of a sphere (equivalent to generating a random unit vector
+     * uniformly). Uses this as axis for the random rotation as well as the
+     * basis for the random translation.
+     * @param length Edge length of the regular tetrahedra.
      */
-    public static List<List<Vector3D>> generateSubsets(List<Vector3D> v) {
-        // Total size of list provided.
-        int n = v.size();
-        if (n <= 0) throw new IllegalArgumentException("Input list should " +
-                "have at least 1 element!");
+    private void randomizePositions(double length) {
+        Space space = Space3D.getInstance();
+        int[] seeds = RandomNumberGeneratorUnix.getRandSeedArray();
+//        System.out.print("[");
+//        for (int s : seeds) System.out.print(s+", ");
+//        System.out.print("]");
+//        System.out.println();
+        IRandom r = new RandomMersenneTwister(seeds);
+        for (int i=0; i<n; i++) {
+            // Create regular tetrahedra.
+            rts[i] = new RegularTetrahedron(length);
 
-        // Generate subsets.
-        List<List<Vector3D>> subsets = new ArrayList<>();
-        for (int i=0; i<(1<<n); i++) {
-            List<Vector3D> set = new ArrayList<>();
-            for (int j=0; j<n; j++)
-                // Check if bit is present or not.
-                if ((i & (1 << j)) > 0) set.add(v.get(j));
-            if (set.size() > 0) subsets.add(set);
-        }
-        return subsets;
-    }
+            // Rotation part.
+            Vector ax = space.makeVector();
+            ax.setRandomSphere(r);
+            Vector3D axis = new Vector3D(ax.toArray());
+            double angle = 2 * Math.PI * r.nextDouble();
 
-    /**
-     * Function to compute whether two tetrahedra intersect or not. Based on
-     * the algorithm explained in detail here:
-     * Y. Kallus, V. Elser, and S. Gravel, "Method for dense packing
-     * discovery," Physical Review E, vol. 82, no. 5, Nov. 2010.
-     *
-     * Short summary:
-     * The algorithm proceeds to first compute all the subsets of the set
-     * formed by the union operation on the sets of vertices of the two
-     * tetrahedra (X1 and X2, say). From this, all subsets of length 3 are
-     * chosen and that contain at least one element each from X1 and X2. A
-     * least-squares plane is found for each of these subsets (S, say). The
-     * least-squares plane is defined as the plane to which the sum of
-     * squared distances of all vertices in a set S is the lowest. Based on
-     * this, a measure of interpenetration \Delta^2 is computed. If \Delta^2
-     * is greater than zero, the two tetrahedra intersect. If \Delta^2 = 0,
-     * they don't.
-     *
-     * @param rt1 Regular tetrahedron instance 1.
-     * @param rt2 Regular tetrahedron instance 2.
-     * @return Whether or not they intersect.
-     */
-    public static boolean isOverlap(RegularTetrahedron rt1,
-                                    RegularTetrahedron rt2) {
+            // Perform rotation.
+            rts[i].rotate(angle, axis);
 
-        // List of vertices of X1.
-        List<Vector3D> X1 = Arrays.asList(rt1.getAllVertices());
-        // All possible subsets.
-        List<List<Vector3D>> subsetsX1 = generateSubsets(X1);
+            // Translation part.
+            Vector displacement = space.makeVector();
+            displacement.setRandomSphere(r);
+            Vector3D disp = new Vector3D(displacement.toArray());
+            double stepSize = length * r.nextDouble();
+            disp = disp.scalarMultiply(stepSize);
 
-        // List of vertices of X2.
-        List<Vector3D> X2 = Arrays.asList(rt2.getAllVertices());
-        // All possible subsets.
-        List<List<Vector3D>> subsetsX2 = generateSubsets(X2);
-
-        // List of vectors formed by the union of X1 and X2.
-        List<Vector3D> X1UX2 = new ArrayList<>();
-        X1UX2.addAll(X1);
-        X1UX2.addAll(X2);
-        // All possible subsets.
-        List<List<Vector3D>> subsetsX1UX2 = generateSubsets(X1UX2);
-
-        int d = 3;
-        // Of all possible subsets of X1 union X2, select those with size of 3.
-        List<List<Vector3D>> S = new ArrayList<>();
-        for (List<Vector3D> v : subsetsX1UX2) if (v.size() == d) S.add(v);
-
-        List<List<Vector3D>> x1 = new ArrayList<>();
-        for (List<Vector3D> v : subsetsX1) if (v.size() == d) x1.add(v);
-        List<List<Vector3D>> x2 = new ArrayList<>();
-        for (List<Vector3D> v : subsetsX2) if (v.size() == d) x2.add(v);
-
-        // From the list S, remove those that don't contain at least one
-        // element each of X1 and X2.
-        for (List<Vector3D> l1 : x1) S.remove(l1);
-        for (List<Vector3D> l2 : x2) S.remove(l2);
-
-        double minDS = Double.POSITIVE_INFINITY;
-        for (List<Vector3D> s : S) {
-            Vector3D[] result = findLeastSqNormal(s);
-            Vector3D centroid = result[0];
-            Vector3D normal = result[1];
-            double h = normal.dotProduct(centroid);
-            double dsp = 0;
-            double dsm = 0;
-            for (Vector3D x : X1) {
-                double dp = normal.dotProduct(x);
-                double value = (dp - h) * (dp - h);
-                if (dp > h) dsp += value;
-                else dsm += value;
-            }
-            for (Vector3D x : X2) {
-                double dp = normal.dotProduct(x);
-                double value = (dp - h) * (dp - h);
-                if (dp > h) dsm += value;
-                else dsp += value;
-            }
-
-            double ds = Math.min(dsp, dsm);
-            minDS = Math.min(minDS, ds);
-        }
-        // If minDS is zero, then a separating plane exists, which implies
-        // that the input tetrahedra don't overlap.
-        return minDS > 0;
-    }
-
-    /**
-     * Function to move the two intersecting tetrahedra by the smallest
-     * displacement of their vertices that resolves the overlap. Following
-     * the procedure outline in detail in:
-     * Y. Kallus, V. Elser, and S. Gravel, "Method for dense packing
-     * discovery," Physical Review E, vol. 82, no. 5, Nov. 2010.
-     *
-     * The set S is defined to be the union of the sets containing the
-     * vertices of the two tetrahedra (X1, X2). The algorithm proceeds to find
-     * the unit normal of the least-squares plane of all subsets of S that
-     * have at least 4 elements in it and are made up of at least one element
-     * of each set. This is used to compute the magnitude of the displacement
-     * needed to resolve the collision. We iterate through all the possible
-     * subsets and find the minimum such displacement and apply that to the
-     * particular subset of S.
-     *
-     * @param rt1 Regular tetrahedron instance 1.
-     * @param rt2 Regular tetrahedron instance 2.
-     */
-    public static void resolveOverlap(RegularTetrahedron rt1,
-                                      RegularTetrahedron rt2) {
-
-        // To compute all the subsets of S that have at least d elements (d =
-        // 4, here) in it and have at least one element from X1 and X2, we
-        // simply get all the subsets of S that have at least d elements in
-        // it and subtract from it the subsets of X1 and X2 that have exactly
-        // d elements in it. Since X1 and X2 have exactly 4 elements, we just
-        // have to subtract them from the list of all subsets.
-
-        assert (!isOverlap(rt1, rt2));
-        // List of vertices of X1.
-        List<Vector3D> X1 = Arrays.asList(rt1.getAllVertices());
-        // All possible subsets.
-        List<List<Vector3D>> subsetsX1 = generateSubsets(X1);
-
-        // List of vertices of X2.
-        List<Vector3D> X2 = Arrays.asList(rt2.getAllVertices());
-        // All possible subsets.
-        List<List<Vector3D>> subsetsX2 = generateSubsets(X2);
-
-        // List of vectors formed by the union of X1 and X2.
-        List<Vector3D> X1UX2 = new ArrayList<>();
-        X1UX2.addAll(X1);
-        X1UX2.addAll(X2);
-        // All possible subsets.
-        List<List<Vector3D>> subsetsX1UX2 = generateSubsets(X1UX2);
-
-        int d = 3;
-        // Of all possible subsets of X1 union X2, select those with size
-        // greater than 3.
-        List<List<Vector3D>> S = new ArrayList<>();
-        for (List<Vector3D> v : subsetsX1UX2) if (v.size() > d) S.add(v);
-
-        // From the list S, remove those that don't contain at least one
-        // element each of X1 and X2. Since for tetrahedra, X1 and X2 have
-        // only 4 vertices each, we only need to remove two lists from S -
-        // one each containing all elements of X1 and X2.
-        S.remove(X1);
-        S.remove(X2);
-
-        double minDS = Double.POSITIVE_INFINITY;
-        List<Vector3D> T = null;
-        double hT = Double.POSITIVE_INFINITY;
-        Vector3D nT = null;
-        for (List<Vector3D> s : S) {
-            Vector3D[] result = findLeastSqNormal(s);
-            Vector3D centroid = result[0];
-            Vector3D normal = result[1];
-            double h = normal.dotProduct(centroid);
-
-            // Get the list of vectors in X1 and X2 that are not in S.
-            List<Vector3D> X1S = new ArrayList<>(X1);
-            List<Vector3D> X2S = new ArrayList<>(X2);
-            for (Vector3D v : s) {
-                X1S.remove(v);
-                X2S.remove(v);
-            }
-
-            // Check if the least-squares plane separates the two sets of
-            // vertices X1S and X2S.
-            double ds2 = Double.POSITIVE_INFINITY;
-            if (doesPlaneSeparate(normal, X1S, X2S)) ds2 =
-                    sumSquaredDist(normal, s);
-            if (ds2 < minDS) {
-                minDS = ds2;
-                hT = h;
-                nT = normal;
-                T = s;
-            }
-        }
-
-        if (nT == null) throw new RuntimeException("Minimization went wrong!");
-
-        for (Vector3D x : T) {
-            Vector3D displacement = new Vector3D((hT - x.dotProduct(nT)), nT);
-            int x1Index = X1.indexOf(x);
-            int x2Index = X2.indexOf(x);
-            if (x1Index != -1) rt1.translateVertex(x1Index, displacement);
-            else if (x2Index != -1) rt2.translateVertex(x2Index, displacement);
-            else throw new RuntimeException("Vertex not found in either X1 or" +
-                        " X2!!!");
+            // Perform translation.
+            rts[i].translateAllVertices(disp);
         }
     }
 
     /**
-     * Function to check if a plane separates two given sets of vectors.
-     * Compares the sign of the dot product of the given sets of vectors to
-     * return true only when the two sets of vectors have opposite signs.
-     * @param normal Unit normal vector of the given plane.
-     * @param set1 First set of vectors.
-     * @param set2 Second set of vectors.
-     * @return Whether the plane separates the two sets of vectors or not.
+     * Function to pack N regular tetrahedra as densely as possible. Choose
+     * edge lengths of different scales to try. For a fixed length, the
+     * algorithm proceeds until it is converged or has reached maximum number
+     * of steps. If the number of overlaps has either increased or stayed the
+     * same compared to the previous iteration, the algorithm performs a
+     * random move (50% probability of rotation and translation). This helps
+     * speed up the convergence rate. If it has converged, we compute the
+     * unit cell parameters, density and store the vertex positions.
      */
-    public static boolean doesPlaneSeparate(Vector3D normal, List<Vector3D>
-            set1, List<Vector3D> set2) {
-        boolean positive = false;
-        boolean negative = false;
-        boolean flag = false;
-        boolean separates = true;
-        for (Vector3D v : set1) {
-            double dot = v.dotProduct(normal);
-            if (!flag) {
-                // Flag has not been set yet. Meaning we have not decided if
-                // this set has positive or negative sign. This will occur
-                // until we encounter the first non-zero valued dot product.
-                flag = true;
-                if (dot > 0) positive = true;
-                else if (dot < 0) negative = true;
-                else flag = false;
-            }
-            else {
-                // If one of the vectors changes sign, no need to check the
-                // rest. We can conclude that the plane doesn't separate.
-                if ((positive && dot < 0) || (negative && dot > 0)) {
-                    separates = false;
+    public void pack() {
+        double[] lengths = new double[] {0.01, 0.2, 0.1, 1, 2, 4};
+        for (double l : lengths) {
+            randomizePositions(l);
+            boolean isConverged = false;
+            int steps = 0;
+            double density = Double.POSITIVE_INFINITY;
+            int prevOverlaps = 0;
+            while (steps++ <= maxSteps) {
+                // Compute pairs of overlapping tetrahedra.
+                Map<Integer, List<Integer>> overlaps = getCurrentOverlaps();
+                int currentOverlaps = overlaps.size();
+                if (currentOverlaps == 0) {
+                    isConverged = true;
                     break;
                 }
-            }
-        }
+                for (Map.Entry<Integer, List<Integer>> entry : overlaps
+                        .entrySet()) {
 
-        if (separates) {
-            for (Vector3D v : set2) {
-                double dot = v.dotProduct(normal);
-                if (!flag) {
-                    flag = true;
-                    if (dot > 0) positive = true;
-                    else if (dot < 0) negative = true;
-                    else flag = false;
-                } else {
-                    if ((positive && dot > 0) || (negative && dot < 0)) {
-                        separates = false;
-                        break;
+                    int index1 = entry.getKey();
+                    for (int index2 : entry.getValue()) {
+                        if (prevOverlaps >= currentOverlaps) {
+                            performRandomMove(index2);
+                        }
+                        od.setR1R2(rts[index1], rts[index2]);
+                        if (od.isOverlap()) od.findDisplacementsToResolve(true);
                     }
+                }
+                prevOverlaps = currentOverlaps;
+            }
+            if (isConverged) {
+                unitCell = computeUnitCellParams();
+                density = computePackingDensity(rts[0].getVolume());
+                if (density > maxDensity) {
+                    maxEdgeLength = l;
+                    maxDensity = density;
+                    vertexPositions = getPositions();
                 }
             }
         }
-        return separates;
+        if (maxDensity != 0.0) {
+            System.out.println("Successfully converged!");
+            printSolution();
+        }
+        else {
+            System.out.println("Failed to converge for all l!");
+        }
     }
 
     /**
-     * Function to compute the sum of squared distances of a list of vectors
-     * to a plane.
-     * @param normal Unit normal vector of the given plane.
-     * @param s List of desired vectors.
-     * @return Sum of squared distances.
+     * Performs a random translation or rotation of the regular tetrahedron
+     * with the specified index. This is used to improve the convergence rate.
+     * @param index2 Index of tetrahedron.
      */
-    public static double sumSquaredDist(Vector3D normal, List<Vector3D> s) {
-        double squaredDist = 0.0;
-        for (Vector3D v : s) {
-            double dot = normal.dotProduct(v);
-            squaredDist += dot * dot;
+    private void performRandomMove(int index2) {
+        IRandom r = new RandomMersenneTwister(RandomNumberGeneratorUnix
+                .getRandSeedArray());
+        Space space = Space3D.getInstance();
+
+        // Perform rotation half the time.
+        if (r.nextInt(1) == 0) {
+            // Rotation part.
+            Vector ax = space.makeVector();
+            ax.setRandomSphere(r);
+            Vector3D axis = new Vector3D(ax.toArray());
+            double angle = 2 * Math.PI * r.nextDouble();
+
+            // Perform rotation.
+            rts[index2].rotate(angle, axis);
         }
-        return squaredDist;
+        else {
+            // Perform translation the other half.
+            // Translation part.
+            Vector displacement = space.makeVector();
+            displacement.setRandomSphere(r);
+            Vector3D disp = new Vector3D(displacement.toArray());
+            double stepSize = rts[index2].getEdgeLength() * r.nextDouble() /
+                    20;
+            disp = disp.scalarMultiply(stepSize);
+            rts[index2].translateAllVertices(disp);
+        }
+    }
+
+    /**
+     * Function to get the unit cell basis vectors.
+     * @return Unit cell basis vectors.
+     */
+    public Vector3D[] getUnitCell() {
+        return unitCell;
+    }
+
+    /**
+     * Function to get the tetrahedra vertex positions.
+     * @return Vertex positions of all tetrahedra.
+     */
+    public Vector3D[][] getVertexPositions() {
+        return vertexPositions;
+    }
+
+    /**
+     * Function to get the maximum density.
+     * @return Maximum density.
+     */
+    public double getMaxDensity() {
+        return maxDensity;
+    }
+
+    /**
+     * Function to print the solution in the desired format.
+     */
+    private void printSolution() {
+        System.out.println("Solution: Packed "+n+" regular tetrahedra with " +
+                "edge length: "+maxEdgeLength+" (arbitrary length units) and " +
+                "packing density of: " +maxDensity);
+        System.out.println("Basis:");
+        for (Vector3D v : unitCell) System.out.println(v.toString());
+        System.out.println("Tetrahedra positions:");
+        for (int i=0; i<n; i++) {
+            for (Vector3D v: vertexPositions[i]) System.out.print(v.toString
+                    ()+" ");
+            System.out.println();
+        }
+    }
+
+    /**
+     * Function to store the vertex positions of all tetrahedra.
+     * @return Vertex positions of all tetrahedra.
+     */
+    private Vector3D[][] getPositions() {
+        vertexPositions = new Vector3D[n][4];
+        for (int i=0; i<n; i++) vertexPositions[i] = rts[i].getAllVertices();
+        return vertexPositions;
+    }
+
+    /**
+     * Function to compute the packing density, given the volume of a single
+     * tetrahedron.
+     * @param tetVolume Volume of a single tetrahedron.
+     * @return Packing density.
+     */
+    private double computePackingDensity(double tetVolume) {
+        double cellVolume = unitCell[0].getNorm() * unitCell[1].getNorm() *
+                unitCell[2].getNorm();
+        return n * tetVolume / cellVolume;
+    }
+
+    /**
+     * Function to compute unit cell basis vectors.
+     * @return Unit cell basis vectors.
+     */
+    private Vector3D[] computeUnitCellParams() {
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        double maxZ = Double.NEGATIVE_INFINITY;
+        for (int i=0; i<n; i++) {
+            Vector3D[] vertices = rts[i].getAllVertices();
+            for (int j=0; j<4; j++) {
+                double x = vertices[j].getX();
+                double y = vertices[j].getY();
+                double z = vertices[j].getZ();
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+                if (z < minZ) minZ = z;
+                if (z > maxZ) maxZ = z;
+            }
+        }
+        Vector3D[] lattice = new Vector3D[3];
+        lattice[0] = new Vector3D(maxX - minX, Vector3D.PLUS_I);
+        lattice[1] = new Vector3D(maxY - minY, Vector3D.PLUS_J);
+        lattice[2] = new Vector3D(maxZ - minZ, Vector3D.PLUS_K);
+        return lattice;
+    }
+
+    /**
+     * Function to compute the map containing the index of one tetrahedron as
+     * the key and a list of indices of the tetrahedra with which it
+     * overlaps, as the value.
+     * @return Map of overlaps.
+     */
+    private Map<Integer, List<Integer>> getCurrentOverlaps() {
+        Map<Integer, List<Integer>> overlaps = new TreeMap<>();
+        for (int i=0; i<n; i++) {
+            for (int j=0; j<i; j++) {
+                od.setR1R2(rts[i], rts[j]);
+                if (od.isOverlap()) {
+                    if (!overlaps.containsKey(j)) overlaps.put(j, new
+                            ArrayList<>());
+                    overlaps.get(j).add(i);
+                }
+            }
+        }
+        return overlaps;
+    }
+
+    /**
+     * Function to set the number of maximum steps to be used in the algorithm.
+     * @param mSteps Desired number. Default is 10,000.
+     */
+    public void setMaxSteps(int mSteps) {
+        maxSteps = mSteps;
     }
 
     public static void main(String[] args) {
-//        System.out.println("Integer.parseInt(\"1110\") = " + Integer.parseInt
-//                ("11100000", 2));
-//        System.out.println("Integer.parseInt(\"01101\") = " + Integer.parseInt
-//                ("01101000", 2));
+        int N = 20;
+        if (args.length >= 1) {
+            try {
+                N = Integer.parseInt(args[0]);
+            } catch (Exception e) {
+                System.out.println("First argument must be of type integer.");
+                System.out.println("Please enter a valid integer. Or to run with " +
 
-//        System.out.println("Math.min(1e-31, 0) = " + Math.min(1e-31, 0));
-//        System.exit(1);
-//        List<Vector3D> l1 = new ArrayList<>();
-//        Vector3D v1 = new Vector3D(new double[]{0, 0, 2});
-//        Vector3D v2 = new Vector3D(new double[]{2, 0, 2});
-//        Vector3D v3 = new Vector3D(new double[]{2, 3, 2});
-//        l1.add(v1);
-//        l1.add(v2);
-//        l1.add(v3);
-//        List<Vector3D> l2 = new ArrayList<>();
-//        Vector3D w1 = new Vector3D(new double[]{0, 0, 4});
-//        Vector3D w2 = new Vector3D(new double[]{-2, 0, 4});
-//        Vector3D w3 = new Vector3D(new double[]{-4, -2, 4});
-//        l2.add(w1);
-//        l2.add(w2);
-//        l2.add(w3);
-//        Vector3D n = origin;
-//        List<Vector3D> l3 = new ArrayList<>();
-//        Vector3D t1 = new Vector3D(new double[]{0, 0, 0});
-//        Vector3D t2 = new Vector3D(new double[]{-2, 0, 2});
-//        Vector3D t3 = new Vector3D(new double[]{-2, -5, -9});
-//        l3.add(t1);
-//        l3.add(t2);
-//        l3.add(t3);
-//        n = n.add(Vector3D.PLUS_I);
-//        n = n.add(Vector3D.PLUS_J);
-//        n = n.add(Vector3D.PLUS_K);
-//        n.normalize();
-//        double d = doesPlaneSeparate(n, l1, l2, l3);
-//        System.out.println(d);
-//        l.sort(new Comparator<Vector3D>() {
-//            @Override
-//            public int compare(Vector3D v1, Vector3D v2) {
-//                return Double.compare(v1.getNorm(), v2.getNorm());
-//            }
-//        });
-//        for (Vector3D v : l) System.out.println(v.toString());
-//        v.remove(v1);
-//        for (List<Vector3D> s : generateSubsets(1, setSize
-//                .AT_LEAST, v))
-//            System.out.println(s.toString());
-//        System.exit(1);
+                        "a default value of 20, simply run it without any " +
+                        "arguments.");
+                System.exit(1);
+            }
+        }
+        PackRegularTetrahedra p = new PackRegularTetrahedra(N);
+        p.pack();
 
-        RegularTetrahedron r1 = new RegularTetrahedron();
-        r1.vertices[0] = new Vector3D(new double[]{2328.824,1256.559,
-                9965.406});//0.0, 0.0, 0.0});
-//        List<Vector3D> l1 = new ArrayList<>();
-//        l1.add(r1.vertices[0]);
-
-//        System.out.println("r1.vertices[0].equals(new Vector3D(new " +
-//                "double[]{0, 0, 0})) = " + r1.vertices[0].equals(new Vector3D
-//                (new double[]{0, 0, 0})));
-//        System.exit(1);
-        r1.vertices[1] = new Vector3D(new double[]{2328.824, 1256.559,
-                9889.206});//50.0, 50.0, 0.0});
-        r1.vertices[2] = new Vector3D(new double[]{2208.937, 1187.342,
-                9965.406});//100.0, 0.0, 0.0});
-        r1.vertices[3] = new Vector3D(new double[]{2132.737,1319.324,
-                9965.406});//50.0, 25.0, 100.0});
-//
-        RegularTetrahedron r2 = new RegularTetrahedron();
-        r2.vertices[0] = new Vector3D(new double[]{2137.673 ,1234.186 ,
-                10003.130});//0.0, 0.0, 0.0});
-//        List<Vector3D> l2 = new ArrayList<>();
-//        l2.add(r2.vertices[0]);
-//        System.out.println("l2.equals(l1) = " + l2.equals(l1));
-//        System.exit(1);
-        r2.vertices[1] = new Vector3D(new double[]{2060.557 ,1281.337 ,
-                9973.415});//-50.0, 50.0, 0.0});
-        r2.vertices[2] = new Vector3D(new double[]{2096.147, 1303.468,
-                9925.334});//-200.0, 0.0, 20.0});
-        r2.vertices[3] = new Vector3D(new double[]{2101.378,1213.231,
-                9973.415});//150.0, 25.0, 100.0});
-        System.out.println("isOverlap(r1, r2) = " + isOverlap(r1, r2));
-        resolveOverlap(r1, r2);
-        System.out.println("isOverlap(r1, r2) = " + isOverlap(r1, r2));
-        for (Vector3D v : r1.vertices) System.out.print(v.toString()+" ");
-        System.out.println();
-        for (Vector3D v : r2.vertices) System.out.print(v.toString()+" ");
-        System.out.println();
-//        Plane p0_012 = new Plane(r1.vertices[0], r1.vertices[1], r1.vertices[2],
-//                1e-10);
-//        Plane p0_123 = new Plane(r1.vertices[1], r1.vertices[2], r1.vertices[3],
-//                1e-10);
-//        Plane p0_230 = new Plane(r1.vertices[2], r1.vertices[3], r1.vertices[0],
-//                1e-10);
-//        Plane p0_301 = new Plane(r1.vertices[3], r1.vertices[0], r1.vertices[1],
-//                1e-10);
-//        Plane p1_012 = new Plane(r2.vertices[0], r2.vertices[1], r2.vertices[2],
-//                1e-10);
-//        Plane p1_123 = new Plane(r2.vertices[1], r2.vertices[2], r2.vertices[3],
-//                1e-10);
-//        Plane p1_230 = new Plane(r2.vertices[2], r2.vertices[3], r2.vertices[0],
-//                1e-10);
-//        Plane p1_301 = new Plane(r2.vertices[3], r2.vertices[0], r2.vertices[1],
-//                1e-10);
-//        System.out.println("p0_012 = " + p0_012.intersection(p1_012));
-//        System.out.println("p0_012 = " + p0_012.intersection(p1_123));
-//        System.out.println("p0_012 = " + p0_012.intersection(p1_230));
-//        System.out.println("p0_012 = " + p0_012.intersection(p1_301));
-//
-//        System.out.println("p0_123 = " + p0_123.intersection(p1_012));
-//        System.out.println("p0_123 = " + p0_123.intersection(p1_123));
-//        System.out.println("p0_123 = " + p0_123.intersection(p1_230));
-//        System.out.println("p0_123 = " + p0_123.intersection(p1_301));
-//
-//        System.out.println("p0_230 = " + p0_230.intersection(p1_012));
-//        System.out.println("p0_230 = " + p0_230.intersection(p1_123));
-//        System.out.println("p0_230 = " + p0_230.intersection(p1_230));
-//        System.out.println("p0_230 = " + p0_230.intersection(p1_301));
-//
-//        System.out.println("p0_301 = " + p0_301.intersection(p1_012));
-//        System.out.println("p0_301 = " + p0_301.intersection(p1_123));
-//        System.out.println("p0_301 = " + p0_301.intersection(p1_230));
-//        System.out.println("p0_301 = " + p0_301.intersection(p1_301));
-//        System.out.println("isOverlapLazy(r1, r2) = " + isOverlapLazy(r1,
-//                r2));
-//        System.out.println("isIntersecting2(r1, r2) = " + isIntersecting2(r1,
-//                r2));
-
-//        resolveCollision(r1, r2);
-//        r2.vertices[0] = new Vector3D(new double[]{100.0001, 0.0, 0.0});
-//        r2.vertices[1] = new Vector3D(new double[]{150.0, 50.0, 0.0});
-//        r2.vertices[2] = new Vector3D(new double[]{200.0, 0.0, 0.0});
-//        r2.vertices[3] = new Vector3D(new double[]{150.0, 25.0, 10.0});
-
-//        System.out.println("isOverlapLazy(r1, r2) = " + isOverlapLazy(r1,
-//                r2));
-//        r1.vertices[0] = new Vector3D(new double[]{2328.824, 1256.559,
-//                9965.406});
-//        r1.vertices[1] = new Vector3D(new double[]{2328.824, 1256.559,
-//                9889.206});
-//        r1.vertices[2] = new Vector3D(new double[]{2208.937, 1187.342,
-//                9965.406});
-//        r1.vertices[3] = new Vector3D(new double[]{2132.737, 1319.324,
-//                9965.406});
-//        r2.vertices[0] = new Vector3D(new double[]{2137.673, 1234.186,
-//                10003.130});
-//        r2.vertices[1] = new Vector3D(new double[]{2060.557, 1281.337,
-//                9973.415});
-//        r2.vertices[2] = new Vector3D(new double[]{2096.147, 1303.468,
-//                9925.334});
-//        r2.vertices[3] = new Vector3D(new double[]{2101.378, 1213.231,
-//                9973.415});
-//        System.out.println("isOverlapLazy(rt1, rt2) = " + isOverlapLazy(r1,
-//                r2));
-//        resolveOverlap(r1, r2);
-//        System.out.println("resolveOverlap(r1, r2) = " + resolveOverlap(r1,
-//                r2));
-//        System.out.println("isIntersecting2(r1, r2) = " + isIntersecting2(r1,
-//                r2));
-//        BlockRealMatrix m = new BlockRealMatrix(3, 3);
-//        m.setRow(1, new double[]{1, 2, 3});
-//        double[][] x = m.getData();
-//        for (double[] x1 : x) {
-//            for (double x2 : x1) System.out.print(x2+" ");
-//            System.out.println();
-//        }
-//        (def p [[2328.824 1256.559 9965.406] [2328.824 1256.559 9889.206] [2208.937 1187.342 9965.406] [2132.737 1319.324 9965.406]])
-//        (def q [[2137.673 1234.186 10003.130] [2060.557 1281.337 9973.415] [2096.147 1303.468 9925.334] [2101.378 1213.231 9973.415]])
-//        (def p [[0.0 0.0 0.0] [50.0 50.0 0.0] [100.0 0.0 0.0] [50.0 25.0 100.0]])
-//        ;(def q [[0.0 0.0 0.0] [-50.0 50.0 0.0] [-200.0 0.0 20.0] [150.0 25.0 100.0]])
     }
 }
-
