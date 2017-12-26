@@ -2,12 +2,12 @@
 An optimization scheme for packing regular tetrahedra. Implements the divide projection of the divide and concur algorithm discussed in detail here:
 Y. Kallus, V. Elser, and S. Gravel, "Method for dense packing discovery", Physical Review E, vol. 82, no. 5, Nov. 2010.
 
-Dependencies: 
+<h3><u>Dependencies</u></h3>
 1. org.apache.commons:commons-math3:3.6.1 (can be downloaded from Maven repository)
-2. etomica.jar (see: https://github.com/etomica/etomica)
+2. etomica.jar (can be downloaded from https://github.com/etomica/etomica)
 3. JUnit4 (can be downloaded from Maven repository)
 
-Usage:
+<h3><u>Usage</u></h3>
 java -cp <path_to_regTetraPacking.jar>:<path_to_commons-math3-3.6.1.jar>:<path_to_etomica.jar> src.PackRegularTerahedra <int_value>
 
 Here <...> denotes user input. For instance, the user must replace <path_to_commons-math3-3.6.1.jar> with the path to commons-math3-3.6.1.jar in her/his local machine. <int_value> denotes any input in the integer format.
@@ -15,15 +15,15 @@ Here <...> denotes user input. For instance, the user must replace <path_to_comm
 <h2><u>Divide and Concur</u></h2>
 My implementation of the packing algorithm is based on the divide and concur algorithm reported by Kallus et al. [1]. The main idea behind the divide and concur algorithm is to solve overlaps pair-wise and combine them efficiently to obtain a packing in which no two shapes overlap. The divide projection is a two-step process involving overlap detection and resolution.
 
-Overlap detection:
+<h3><u>Overlap detection</u></h3>
 In a d-dimensional space, let the set of vertices of the two tetrahedra be X1 and X2 respectively. Let S denote all the subsets of X1 U X2 (here U denotes the union operation) of size d that contain at least one vertex from each tetrahedra. For every set in S, we find the least-squares plane (i.e., a plane that minimizes the sum of squared distances from a set of points to it) and check to see if separates the sets X1\S and X2\S. Here, X1\S and X2\S are the sets that are formed by removing the vertices present in S from X1 and X2 respectively. If there exists such a separating plane, then the two tetrahedra don’t overlap.
 
-Overlap resolution:
+<h3><u>Overlap resolution</u></h3>
 If no such separating plane exists, then we can find one. Let S denote all the subsets of X1 U X2 (here U denotes the union operation) of size greater than d that contain at least one vertex from each tetrahedra. For every set in S, we find the least-squares plane (i.e., a plane that minimizes the sum of squared distances from a set of points to it) and check to see if separates the sets X1\S and X2\S. Here, X1\S and X2\S are the sets that are formed by removing the vertices present in S from X1 and X2 respectively. If there exists such a separating plane, then the minimum displacement is set to the sum of squared distances of the set S to the plane. Otherwise, we simply ignore this set S. The overall minimum displacement required to resolve the overlap is obtained by computing the minimum of all such ‘sum of squared distances’.
 
 In the original algorithm, the overlap resolution step usually results in non-congruent tetrahedra. To maintain congruency, we simply translate the entire tetrahedra by a displacement which is equal to the sum of displacements for each of its vertices in the set S that results in the best least-squares plane.
 
-<h2><u>Summary of approach</u></h2>
+<h3><u>Summary of approach</u></h3>
 <ol>
 <li> Obtain input 'N' denoting the number of regular tetrahedra to pack, from the user.</li>
 <li> Initialize the possible length of edges to an array containing few values:
